@@ -1,0 +1,1047 @@
+---
+title: "adrd_signal_figures"
+author: "Steven Balog"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Initial Setup
+
+This section prepares the environment and loads the analytic datasets needed for the analysis. We also ensure that in the non-ADRD group, each individual is represented by only one randomly chosen claim date, avoiding multiple counting of the same person.
+
+## Step 1: Load packages and set chunk options
+
+We use the following R packages:
+
+tidyverse: for data wrangling and manipulation.
+
+haven: for reading SAS/Stata/SPSS files (may be used later).
+
+tableone: for generating descriptive statistics tables (commonly used in clinical/epidemiological analyses).
+
+knitr: to control chunk behavior in R Markdown.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(haven)
+library(tableone)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Step 2: Load matched analytic datasets  
+
+We load the pre-processed matched analytic datasets from .RDS files. Each dataset corresponds to a different control group matched to ADRD patients:  
+- AMI: Acute Myocardial Infarction  
+- Asthma  
+- COPD: Chronic Obstructive Pulmonary Disease  
+- Diabetes  
+- No ADRD: overall non-ADRD group  
+
+```{r}
+# --- Load matched analytic datasets --------------------------------------
+matched_ami_analytic_b_1_1 <- readRDS('//file_path/matched_ami_analytic_b_1_1.RDS')
+matched_asth_analytic_b_1_1 <- readRDS('//file_path/matched_asth_analytic_b_1_1.RDS')
+matched_copd_analytic_b_1_1 <- readRDS('//file_path/matched_copd_analytic_b_1_1.RDS')
+matched_diab_analytic_b_1_1 <- readRDS('//file_path/matched_diab_analytic_b_1_1.RDS')
+matched_noadrd_all_analytic_b_1_1 <- readRDS('//file_path/matched_noadrd_analytic_b_1_1.RDS')
+```
+
+## Step 3: Randomly select one claim date per non-ADRD individual  
+
+In the overall non-ADRD dataset, each beneficiary (bene_id_18900) may appear multiple times with different claim dates. To avoid over-representing the same person, we:  
+
+1. Group by unique_id (person-claim combination) and keep the first row, collapsing to the person-claim level.  
+2. Group by bene_id_18900 and randomly select one claim date per person.  
+   - We use a stored random seed (adrd_seed) to make this sampling reproducible.  
+3. Select only the chosen unique_ids and join back to the full dataset to restore other variables.  
+4. Ungroup to return a clean, de-grouped dataframe.  
+
+The result is a dataset where each person in the non-ADRD group contributes only one randomly selected claim.  
+
+```{r}
+# --- Randomly sample one claim per non-ADRD person -----------------------
+adrd_seed <- readRDS('//file_path/adrd_seed.RDS')
+set.seed(adrd_seed) # Ensures reproducibility
+
+matched_noadrd_all_analytic_c <- matched_noadrd_all_analytic_b %>%
+  group_by(unique_id) %>% # keep one row per unique_id (drop duplicate rel_month)
+  slice_head(n=1) %>% 
+  group_by(bene_id_18900) %>% 
+  slice_sample(n=1) %>% # randomly select one claim per beneficiary
+  select(unique_id) %>% # keep only selected unique_ids
+  left_join(matched_noadrd_all_analytic_b) %>%
+  ungroup()
+```
+
+# Table 1
+
+## Age, sex, race
+
+We generate Table 1 of descriptive statistics, summarizing demographics (age, sex, and race) for ADRD patients and their matched control groups. Table 1 is a standard way to compare baseline characteristics across groups in epidemiological and clinical studies.
+
+This code:
+
+1) Reduces each dataset to person-level (one row per individual).
+
+2) Creates categorical variables for age and race.
+
+3) Applies labels to categorical variables for readability.
+
+4) Uses the tableone package to create tables stratified by ADRD status.
+
+5) Combines results for the four control groups (AMI, asthma, COPD, diabetes) and the overall non-ADRD group into one consolidated table.
+
+### Step 1: Define function to create Table 1  
+
+The function iterate_table_one() takes a dataset and a control group label as inputs, then:  
+
+1. Collapse to person-level: Keeps the first row per unique_id.  
+2. Categorize age: Creates age_cat with bins (68–75, 76–80, 80–85, 85+).  
+3. Recode race: Combines “other,” “unknown,” and “North American Native” into a single group, while keeping White, Black, Asian, and Hispanic as separate categories.  
+4. Relabel categorical variables:  
+   - sex_ident_cd: coded as “Male” / “Female”.  
+   - adrd_ever: labeled as “ADRD” or the relevant control group.  
+5. Relevel reference: Sets female as the reference group for sex.  
+6. Create Table 1: Using CreateTableOne(), stratify by ADRD status and report summary statistics. Standardized mean differences (SMDs) are included to compare balance between groups. 
+
+```{r}
+iterate_table_one <- function(data, control_string){
+  
+  temp <- data %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>% # reduce to person-level
+    mutate(age_cat = case_when(
+      # Categorize age into bins
+      diagnosis_age >= 68 & diagnosis_age < 75 ~ '68 - 75',
+      diagnosis_age < 80 ~ '76 - 80',
+      diagnosis_age < 85 ~ '80 - 85',
+      diagnosis_age >= 85 ~ '85 +'
+    )) %>%
+    # Recode race categories
+    mutate(race = case_when(
+      bene_race_cd == 0 | bene_race_cd == 3 | bene_race_cd == 6 ~ 'Unknown/Other',
+      bene_race_cd == 1 ~ 'White',
+      bene_race_cd == 2 ~ 'Black',
+      bene_race_cd == 4 ~ 'Asian',
+      bene_race_cd == 5 ~ 'Hispanic'
+    ))
+  
+  # Apply readable labels
+  temp$sex_ident_cd <- factor(temp$sex_ident_cd, labels = c('Male', 'Female'))
+  temp$adrd_ever <- factor(temp$adrd_ever, labels = c(control_string, 'ADRD'))
+  
+  # Set female as the reference category
+  temp$sex_ident_cd <- relevel(factor(temp$sex_ident_cd), ref = 2)
+  
+  # Variables to include in Table 1
+  myvars <- c('sex_ident_cd', 'race', 'age_cat', 'diagnosis_age')
+  catvars <- c('sex_ident_cd', 'race', 'age_cat')
+  
+  # Create table stratified by ADRD status
+  table1 <- CreateTableOne(
+    vars = myvars,
+    factorVars = catvars,
+    strata = 'adrd_ever',
+    test = FALSE, # disable hypothesis testing
+    data = temp)
+  
+  # Format the table output with standardized mean differences (SMDs)
+  table <- print(table1, 
+                 exact = "stage", 
+                 quote = FALSE, 
+                 noSpaces = TRUE, 
+                 printToggle = FALSE, 
+                 smd = TRUE)
+  return(table)
+}
+```
+
+### Step 2: Generate tables for each control group  
+
+We apply the function to each matched dataset, creating separate Table 1s for: AMI, Asthma, COPD, Diabetes, and No ADRD.  
+
+```{r}
+table1_ami_1_1 <- as.data.frame(iterate_table_one(matched_ami_analytic_b_1_1, 'AMI'))
+table1_asth_1_1 <- as.data.frame(iterate_table_one(matched_asth_analytic_b_1_1, 'Asthma'))
+table1_copd_1_1 <- as.data.frame(iterate_table_one(matched_copd_analytic_b_1_1, 'COPD'))
+table1_diab_1_1 <- as.data.frame(iterate_table_one(matched_diab_analytic_b_1_1, 'Diabetes'))
+table1_noadrd_1_1 <- as.data.frame(iterate_table_one(matched_noadrd_all_analytic_b_1_1, 'No ADRD'))
+```
+
+### Step 3: Combine into a single consolidated Table 1  
+
+Finally, we combine the individual tables into one comprehensive table. For clarity:  
+- Each control group’s SMD column is renamed (e.g., “AMI SMD,” “Asthma SMD”).  
+- Redundant ADRD columns are dropped as we combine.  
+- The final table places the ADRD and No ADRD columns together for easier comparison.  
+
+
+```{r}
+table1_combined_1_1 <- table1_ami_1_1 %>%
+  rename('AMI SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table1_asth_1_1) %>%
+  rename('Asthma SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table1_copd_1_1) %>%
+  rename('COPD SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table1_diab_1_1) %>%
+  rename('Diabetes SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table1_noadrd_1_1) %>%
+  rename('No ADRD SMD' = SMD) %>%
+  relocate(ADRD, 'No ADRD','No ADRD SMD')
+
+# Save the final combined table for later use
+saveRDS(table1_combined_1_1, file = '//file_path/table1_combined_1_1.RDS')
+```
+
+## Comorbidities
+
+In this section, we bring together information on chronic conditions from Medicare master beneficiary summary files (MBSF) and merge them into our analytic cohorts (ADRD and matched controls). This allows us to assess baseline comorbidity burden and compare ADRD patients to controls.
+
+The workflow is:
+
+1) Concatenate all study cohorts into one dataset of beneficiaries.
+
+2) Subset the Medicare Beneficiary Summary File (MBSF) to keep only relevant Chronic Condition Warehouse (CCW) indicators.
+
+3) Create a merged comorbidity dataset (keeping only the most recent year per person).
+
+4) Build a function that merges comorbidity data into each analytic dataset, creates indicator variables for each condition prior to diagnosis, and generates summary tables stratified by ADRD status.
+
+5) Apply the function to all control groups and combine results.
+
+### Step 1: Concatenate beneficiary IDs
+
+We create a single dataset of unique beneficiaries across all analytic cohorts. This ensures we can later subset the MBSF Part D and CCW files efficiently in SAS to obtain comorbidities and medication histories.
+
+```{r eval=FALSE}
+analytic_bene <- bind_rows(matched_ami_analytic_b_1_1, matched_asth_analytic_b_1_1, matched_copd_analytic_b_1_1, matched_diab_analytic_b_1_1, matched_noadrd_all_analytic_b_1_1) %>%
+  select(bene_id_18900) %>%
+  distinct()
+```
+
+### Step 2: Subset MBSF CCW files  
+
+We define a function mbsf_ccw() to load yearly CCW files (in .dta format), keeping only the relevant comorbidity indicators (e.g., glaucoma, depression, stroke, diabetes, COPD). We then stack yearly datasets (2006–2017) into one.  
+
+```{r}
+mbsf_ccw <- function(year){
+  file_path <- str_c("//file_path/MBSF_CC_", year, ".dta")
+mbsf_base <- read_dta(file_path) %>%
+  select(bid_chop_1, bene_enrollmt_ref_yr, glaucoma_ever, alzh_ever, alzh_demen_ever, depression_ever, stroke_tia_ever, ami_ever, chf_ever, ischemicheart_ever, chronickidney_ever, copd_ever, diabetes_ever, hypoth_ever, ra_oa_ever, hypert_ever, cataract_ever, asthma_ever)
+return(mbsf_base)
+}
+
+# Bind years 2006–2017
+mbsf_ccw <-  mbsf_ccw("2006") %>%
+  bind_rows(mbsf_ccw("2007")) %>%
+  bind_rows(mbsf_ccw("2008")) %>%
+  bind_rows(mbsf_ccw("2009")) %>%
+  bind_rows(mbsf_ccw("2010")) %>%
+  bind_rows(mbsf_ccw("2011")) %>%
+  bind_rows(mbsf_ccw("2012")) %>%
+  bind_rows(mbsf_ccw("2013")) %>%
+  bind_rows(mbsf_ccw("2014")) %>%
+  bind_rows(mbsf_ccw("2015")) %>%
+  bind_rows(mbsf_ccw("2016")) %>%
+  bind_rows(mbsf_ccw("2017"))
+```
+
+### Step 3: Subset “other” CCW diagnoses  
+
+A second function mbsf_ccw_other() handles additional conditions (e.g., sensory impairments, psychiatric diagnoses, epilepsy, multiple sclerosis). Again, we bind years 2006–2017.  
+
+```{r}
+mbsf_ccw_other <- function(year){
+  file_path <- str_c("//file_path/MBSF_OTCC_", year, ".dta")
+mbsf_base <- read_dta(file_path) %>%
+  select(bid_chop_1, bene_enrollmt_ref_yr, visual_medicare_ever, hearim_medicare_ever, epilep_medicare_ever, schiot_medicare_ever, anxi_medicare_ever, acp_medicare_ever, bipl_medicare_ever, psds_medicare_ever, brainj_medicare_ever, mulscl_medicare_ever, musdys_medicare_ever, migraine_medicare_ever, spiinj_medicare_ever, pvd_medicare_ever, fibro_medicare_ever, mobimp_medicare_ever)
+return(mbsf_base)
+}
+
+# Bind years 2006–2017
+mbsf_ccw_other <-  mbsf_ccw_other("2006") %>%
+  bind_rows(mbsf_ccw_other("2007")) %>%
+  bind_rows(mbsf_ccw_other("2008")) %>%
+  bind_rows(mbsf_ccw_other("2009")) %>%
+  bind_rows(mbsf_ccw_other("2010")) %>%
+  bind_rows(mbsf_ccw_other("2011")) %>%
+  bind_rows(mbsf_ccw_other("2012")) %>%
+  bind_rows(mbsf_ccw_other("2013")) %>%
+  bind_rows(mbsf_ccw_other("2014")) %>%
+  bind_rows(mbsf_ccw_other("2015")) %>%
+  bind_rows(mbsf_ccw_other("2016")) %>%
+  bind_rows(mbsf_ccw_other("2017"))
+```
+
+### Step 4: Merge CCW datasets  
+
+We combine the standard and “other” CCW files, keeping only the most recent enrollment year per beneficiary. This ensures that for each individual, we retain the latest comorbidity status.  
+
+```{r}
+comorbidities_merge <- mbsf_ccw %>%
+  full_join(mbsf_ccw_other) %>%
+  rename(bene_id_18900 = bid_chop_1) %>%
+  group_by(bene_id_18900) %>%
+  slice_max(bene_enrollmt_ref_yr) %>%
+  ungroup() %>%
+  select(-bene_enrollmt_ref_yr)
+```
+
+### Step 5: Create comorbidity indicators  
+
+We define a function comorbidities() that:  
+
+1. Aligns diagnosis dates:  
+   - For controls: uses their condition-specific diagnosis date.  
+   - For ADRD: uses the bynum_standard_first_date.  
+2. Merges with comorbidities_merge.  
+3. Creates binary comorbidity indicators (0/1) for each condition, flagged if diagnosis occurred before the ADRD/control diagnosis date.  
+4. Labels ADRD vs. control groups.  
+5. Uses tableone to generate a table of comorbidity prevalence, stratified by ADRD status, with standardized mean differences (SMDs).  
+
+```{r comorbidities}
+comorbidities <- function(dataset, diagnosis_date, control_string){
+  
+  # Align diagnosis dates for ADRD vs. control group
+  dataset <- dataset %>%
+    mutate(diag_date = case_when(
+      adrd_ever == 0 ~ diagnosis_date,
+      adrd_ever == 1 ~ bynum_standard_first_date
+    ))
+  
+  comorbidities_merged <- dataset %>%
+    #filter(adrd_ever == 0) %>% #only want to subset the control population here
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+    left_join(comorbidities_merge) %>%
+    #Glaucoma
+    mutate(glaucoma = case_when(
+      glaucoma_ever < diag_date & !is.na(glaucoma_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Sensory blindness and visual impairment
+    mutate(visual_impair = case_when(
+      visual_medicare_ever < diag_date & !is.na(visual_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Sensory deafness and hearing impairment
+    mutate(hearing_impair = case_when(
+      hearim_medicare_ever < diag_date & !is.na(hearim_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Alzheimer's disease and related or senile dementia (from the CCW indicator in the MBSF file)
+    mutate(alzdem_ccw = case_when(
+      alzh_demen_ever < diag_date & !is.na(alzh_demen_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Epilepsy
+    mutate(epilepsy = case_when(
+      epilep_medicare_ever < diag_date & !is.na(epilep_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Schizophrenia and other psychotic disorders
+    mutate(schiz_and_psychotic = case_when(
+      schiot_medicare_ever < diag_date & !is.na(schiot_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Anxiety disorders
+    mutate(anxiety = case_when(
+      anxi_medicare_ever < diag_date & !is.na(anxi_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Depression
+    mutate(depression = case_when(
+      depression_ever < diag_date & !is.na(depression_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Attention-deficit/hyperactivity disorder and other conduct disorders
+    mutate(adhd_and_other_conduct = case_when(
+      acp_medicare_ever < diag_date & !is.na(acp_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Bipolar disorder
+    mutate(bipolar = case_when(
+      bipl_medicare_ever < diag_date & !is.na(bipl_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Personality disorders
+    mutate(personality_disorder = case_when(
+      psds_medicare_ever < diag_date & !is.na(psds_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Traumatic brain injury and nonpsychotic mental disorders due to brain damage
+    mutate(brain_injury = case_when(
+      brainj_medicare_ever < diag_date & !is.na(brainj_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Stroke or transient ischemic attack
+    mutate(stroke = case_when(
+      stroke_tia_ever < diag_date & !is.na(stroke_tia_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Multiple sclerosis and transverse myelitis
+    mutate(multiple_sclerosis = case_when(
+      mulscl_medicare_ever < diag_date & !is.na(mulscl_medicare_ever) ~ 1, 
+      TRUE ~ 0
+    )) %>%
+    #Muscular dystrophy
+    mutate(muscular_dystrophy = case_when(
+      musdys_medicare_ever < diag_date & !is.na(musdys_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Migraine and other chronic headache
+    mutate(migraine = case_when(
+      migraine_medicare_ever < diag_date & !is.na(migraine_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Spinal cord injury
+    mutate(spinal_injury = case_when(
+      spiinj_medicare_ever < diag_date & !is.na(spiinj_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Acute myocardial infarction
+    mutate(ami = case_when(
+      ami_ever < diag_date & !is.na(ami_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Heart failure
+    mutate(heart_failure = case_when(
+      chf_ever < diag_date & !is.na(chf_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Ischemic heart disease
+    mutate(ischemic_heart = case_when(
+      ischemicheart_ever < diag_date & !is.na(ischemicheart_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Peripheral vascular disease
+    mutate(peri_vascular_disease = case_when(
+      pvd_medicare_ever < diag_date & !is.na(pvd_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Chronic obstructive pulmonary disorder
+    mutate(copd = case_when(
+      copd_ever < diag_date & !is.na(copd_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Acquired hypothyroidism
+    mutate(hypothyroid = case_when(
+      hypoth_ever < diag_date & !is.na(hypoth_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Diabetes
+    mutate(diabetes = case_when(
+      diabetes_ever < diag_date & !is.na(diabetes_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Chronic kidney disease
+    mutate(chronic_kidney = case_when(
+      chronickidney_ever < diag_date & !is.na(chronickidney_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Rheumatoid/osteoarthritis
+    mutate(arthritis = case_when(
+      ra_oa_ever < diag_date & !is.na(ra_oa_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Chronic pain fatigue and fibromyalgia
+    mutate(fatigue_fibromyalgia = case_when(
+      fibro_medicare_ever < diag_date & !is.na(fibro_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Hypertension
+    mutate(hypertension = case_when(
+      hypert_ever < diag_date & !is.na(hypert_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Mobility impairments
+    mutate(mobility_impair = case_when(
+      mobimp_medicare_ever < diag_date & !is.na(mobimp_medicare_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #Cataracts
+    mutate(cataracts = case_when(
+      cataract_ever < diag_date & !is.na(cataract_ever) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    #asthma
+    mutate(asthma = case_when(
+      asthma_ever < diag_date & !is.na(asthma_ever) ~ 1,
+      TRUE ~ 0
+    ))
+  
+  # Relabel groups
+  comorbidities_merged$adrd_ever <- factor(comorbidities_merged$adrd_ever, labels = c(control_string, 'ADRD'))
+  
+  # Variables to include in Table 1
+  myvars <- c('ami', 'asthma', 'anxiety', 'cataracts', 'chronic_kidney', 'copd', 'heart_failure', 'diabetes', 'epilepsy', 'glaucoma', 'hypertension', 'ischemic_heart', 'migraine', 'mobility_impair', 'peri_vascular_disease', 'arthritis', 'schiz_and_psychotic', 'visual_impair', 'hearing_impair', 'stroke')
+  catvars <- c('ami', 'asthma', 'anxiety', 'cataracts', 'chronic_kidney', 'copd', 'heart_failure', 'diabetes', 'epilepsy', 'glaucoma', 'hypertension', 'ischemic_heart', 'migraine', 'mobility_impair', 'peri_vascular_disease', 'arthritis', 'schiz_and_psychotic', 'visual_impair', 'hearing_impair', 'stroke')
+  
+  # Generate table stratified by ADRD status
+  table1 <- CreateTableOne(
+    vars = myvars,
+    factorVars = catvars,
+    strata = 'adrd_ever',
+    test = FALSE,
+    data = comorbidities_merged)
+  
+  table <- print(table1, exact = "stage", quote = FALSE, noSpaces = TRUE, printToggle = FALSE,
+                 smd = TRUE)
+  return(table)
+}
+```
+
+### Step 6: Apply to each analytic cohort  
+
+We run the comorbidity function for each control group and ADRD, then combine the results into one consolidated table with renamed SMD columns for clarity.  
+
+```{r}
+comorbidities_ami_1_1 <- as.data.frame(comorbidities(matched_ami_analytic_b_1_1, matched_ami_analytic_b_1_1$hkc_ami_fst, "AMI"))
+comorbidities_asth_1_1 <- as.data.frame(comorbidities(matched_asth_analytic_b_1_1, matched_asth_analytic_b_1_1$hkc_asth_fst, 'Asthma'))
+comorbidities_copd_1_1 <- as.data.frame(comorbidities(matched_copd_analytic_b_1_1, matched_copd_analytic_b_1_1$hkc_copd_fst, 'COPD'))
+comorbidities_diab_1_1 <- as.data.frame(comorbidities(matched_diab_analytic_b_1_1, matched_diab_analytic_b_1_1$hkc_diab_fst, 'Diabetes'))
+comorbidities_noadrd_1_1 <- as.data.frame(comorbidities(matched_noadrd_all_analytic_b_1_1, matched_noadrd_all_analytic_b_1_1$claim_date, 'No ADRD'))
+
+# Combine into one summary table
+comorbidities_combined_1_1 <- comorbidities_ami_1_1 %>%
+  rename('AMI SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(comorbidities_asth_1_1) %>%
+  rename('Asthma SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(comorbidities_copd_1_1) %>%
+  rename('COPD SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(comorbidities_diab_1_1) %>%
+  rename('Diabetes SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(comorbidities_noadrd_1_1) %>%
+  rename('No ADRD SMD' = SMD) %>%
+  relocate(ADRD, 'No ADRD','No ADRD SMD')
+
+# Save final table
+saveRDS(comorbidities_combined_1_1, file = '//file_path/comorbidities_combined_1_1.RDS')
+```
+
+# Table 2 (Crash Rates)
+
+This section builds period indicators (3/6/12/24/36 months relative to diagnosis), constructs per–person-month crash flags, and then summarizes whether each person had ≥1 crash within each period. Results are formatted with tableone to show counts/percents by ADRD vs. control, along with SMDs.
+
+## Create time periods
+
+Goal: For each row (person-month), flag whether it belongs to one of the time windows of interest and derive 0/1 indicators for crash in that month.
+
+Period flags:
+
+  - three_month: months 0–3
+
+  - six_month: months 0–6
+
+  - one_year: months 0–12
+
+  - two_year: months 0–24
+
+  - three_year: months 0–36
+
+Monthly indicators:
+
+  - crash_in_month = 1 if crashonly_month == 1.
+
+
+## Create time periods
+
+Prevalence of at least one crash during each time period
+
+First create an indicator variable for time periods, indicating which months relative to the diagnosis belong to each period of interest. Then create an indicator variable for the presence of a crash and/or citation in the month. For citations only, this should be independent of a crash/ not crash related. This means that the crash and citation cannot occur on the same day.
+
+```{r}
+create_time_periods <- function(data){
+  temp <- data %>%
+    # Flag months that fall into each lookback window (0 = index month)
+    mutate(three_month = case_when(
+      rel_month %in% c(0 : 3) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    mutate(six_month = case_when(
+      rel_month %in% c(0 : 6) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    mutate(one_year = case_when(
+      rel_month %in% c(0 : 12) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    mutate(two_year = case_when(
+      rel_month %in% c(0 : 24) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    mutate(three_year = case_when(
+      rel_month %in% c(0 : 36) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    # Reduce to a single row per person-month if duplicates exist
+    group_by(unique_id, rel_month) %>%
+    slice_head(n=1) %>%
+    # Monthly crash indicator
+    mutate(crash_in_month = case_when(
+      crashonly_month == 1 ~ 1,
+      TRUE ~ 0
+    ))
+}
+
+# Apply to each cohort
+matched_ami_analytic_c_1_1 <- create_time_periods(matched_ami_analytic_b_1_1)
+matched_asth_analytic_c_1_1 <- create_time_periods(matched_asth_analytic_b_1_1)
+matched_copd_analytic_c_1_1 <- create_time_periods(matched_copd_analytic_b_1_1)
+matched_diab_analytic_c_1_1 <- create_time_periods(matched_diab_analytic_b_1_1)
+matched_noadrd_all_analytic_c_1_1 <- create_time_periods(matched_noadrd_all_analytic_b_1_1)
+```
+
+## Prevalence of ≥1 crash
+
+Goal: Determine the prevalence of ≥1 crash within each window (3, 6, 12, 24, 36 months), by ADRD vs. control.
+
+For each window, we:
+
+1. Filter to rows in that window (e.g., six_month == 1).  
+2. Sum crash_count across months per person to get the number of crashes in-window.  
+3. Create a binary flag for ≥1 crash in-window.  
+4. Reduce to one row per person and keep just the flag + adrd_ever.  
+5. full_join() the results for all windows and relabel adrd_ever for readability.  
+6. Use CreateTableOne() to compute counts/percents and SMDs for ADRD vs. control.
+
+```{r Table 2, message=FALSE}
+table2 <- function(data, control){
+  
+  # 0–3 months
+  temp1 <- data %>%
+    filter(three_month == 1) %>%
+    group_by(unique_id, three_month) %>%
+    mutate(three_month_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate('Crash in Three Months' = case_when(
+      three_month_crash_num > 0 ~ 1,
+      TRUE ~ 0
+    )) %>% 
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+  select(unique_id, three_month, adrd_ever, 'Crash in Three Months')
+  
+  # 0–6 months
+  temp2 <- data %>%
+    filter(six_month == 1) %>%
+    group_by(unique_id, six_month) %>%
+    mutate(six_month_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate('Crash in Six Months' = case_when(
+      six_month_crash_num > 0 ~ 1,
+      TRUE ~ 0
+    )) %>% 
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+  select(unique_id, six_month, adrd_ever, 'Crash in Six Months')
+  
+  # 0–12 months
+  temp3 <- data %>%
+    filter(one_year == 1) %>%
+    group_by(unique_id, one_year) %>%
+    mutate(one_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate('Crash in One Year' = case_when(
+      one_year_crash_num > 0 ~ 1,
+      TRUE ~ 0
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+  select(unique_id, one_year, adrd_ever, 'Crash in One Year')
+  
+  # 0–24 months
+  temp4 <- data %>%
+    filter(two_year == 1) %>%
+    group_by(unique_id, two_year) %>%
+    mutate(two_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate('Crash in Two Years' = case_when(
+      two_year_crash_num > 0 ~ 1,
+      TRUE ~ 0
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+  select(unique_id, two_year, adrd_ever, 'Crash in Two Years')
+  
+  # 0–36 months
+  temp5 <- data %>%
+    filter(three_year == 1) %>%
+    group_by(unique_id, three_year) %>%
+    mutate(three_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate('Crash in Three Years' = case_when(
+      three_year_crash_num > 0 ~ 1,
+      TRUE ~ 0
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+  select(unique_id, three_year, adrd_ever, 'Crash in Three Years')
+  
+  # Merge all window flags
+  temp6 <- temp1 %>% full_join(temp2) %>% full_join(temp3) %>% full_join(temp4) %>% full_join(temp5) %>%
+    mutate(adrd_ever = case_when(
+      adrd_ever == 1 ~ 'ADRD',
+      adrd_ever == 0 ~ control
+    ))
+  
+  # Variables to include
+  myvars <- c('Crash in Three Months', 'Crash in Six Months', 'Crash in One Year', 'Crash in Two Years', 'Crash in Three Years')
+  catvars <- c('Crash in Three Months', 'Crash in Six Months', 'Crash in One Year', 'Crash in Two Years', 'Crash in Three Years')
+  
+  library(tableone)
+  
+  table1 <- CreateTableOne(
+    vars = myvars,
+    factorVars = catvars,
+    strata = 'adrd_ever',
+    test = FALSE,
+    data = temp6)
+  
+  table <- print(table1, exact = "stage", quote = FALSE, noSpaces = TRUE, printToggle = FALSE, smd = TRUE)
+  return(table)
+}
+```
+
+Run for each group and merge
+
+```{r}
+table2_ami_1_1 <- as.data.frame(table2(matched_ami_analytic_c_1_1, 'AMI'))
+table2_asth_1_1 <- as.data.frame(table2(matched_asth_analytic_c_1_1, 'Asthma'))
+table2_copc_1_1 <- as.data.frame(table2(matched_copd_analytic_c_1_1, 'COPD'))
+table2_diab_1_1 <- as.data.frame(table2(matched_diab_analytic_c_1_1, 'Diabetes'))
+table2_noadrc_1_1 <- as.data.frame(table2(matched_noadrd_all_analytic_c_1_1, 'No ADRD'))
+
+table2_combined_1_1 <- table2_ami_1_1 %>%
+  rename('AMI SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table2_asth_1_1) %>%
+  rename('Asthma SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table2_copd_1_1) %>%
+  rename('COPD SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table2_diab_1_1) %>%
+  rename('Diabetes SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table2_noadrd_1_1) %>%
+  rename('No ADRD SMD' = SMD) %>%
+  relocate(ADRD, 'No ADRD','No ADRD SMD')
+
+# Save the combined Table 2
+saveRDS(table2_combined_1_1, file = '//file_path/table2_combined_1_1.RDS')
+```
+
+## Prevalence of >1 crash 
+
+We categorize each person’s total number of crashes within defined windows before diagnosis—3, 6, 12, 24, and 36 months—into:
+
+  - “No crash”
+
+  - “1 crash”
+
+  - “>1 crash”
+
+This uses the previously computed monthly crash_count and the window flags (three_month, six_month, one_year, two_year, three_year). For each window we: 
+
+1) sum crash_count across the months in-window per person, 
+2) label the summed count into one of the three categories, 
+3) reduce to one row per person, and 
+4) join the five window summaries together. 
+5) Finally, we produce a tableone frequency table stratified by adrd_ever (ADRD vs. control).
+
+```{r}
+table3 <- function(data, control){
+  
+  # ---- 0–3 months window: sum crash_count across the window and categorize ----
+  temp1 <- data %>%
+    filter(three_month == 1) %>%
+    group_by(unique_id, three_month) %>%
+    mutate(three_month_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(three_month_crash_ind = case_when(
+      three_month_crash_num == 0 ~ 'No crash within 3 months',
+      three_month_crash_num == 1 ~ '1 crash within 3 months',
+      three_month_crash_num > 1 ~ '>1 crash within 3 months',
+      TRUE ~ ''
+    )) %>% 
+    group_by(unique_id) %>%
+    slice_head(n=1) %>% # one row per person
+    select(unique_id, three_month, adrd_ever, three_month_crash_ind)
+  
+  # Set category order for nicer table display
+  temp1$three_month_crash_ind <- factor(temp1$three_month_crash_ind, levels = c('No crash within 3 months', '1 crash within 3 months', '>1 crash within 3 months'))
+  
+  # ---- 0–6 months window ----
+  temp2 <- data %>%
+    filter(six_month == 1) %>%
+    group_by(unique_id, six_month) %>%
+    mutate(six_month_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(six_month_crash_ind = case_when(
+      six_month_crash_num == 0 ~ 'No crash within 6 months',
+      six_month_crash_num == 1 ~ '1 crash within 6 months',
+      six_month_crash_num > 1 ~ '>1 crash within 6 months',
+      TRUE ~ ''
+    )) %>% 
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+    select(unique_id, six_month, adrd_ever, six_month_crash_ind)
+  
+  temp2$six_month_crash_ind <- factor(temp2$six_month_crash_ind, levels = c('No crash within 6 months', '1 crash within 6 months', '>1 crash within 6 months'))
+  
+  # ---- 0–12 months window ----
+  temp3 <- data %>%
+    filter(one_year == 1) %>%
+    group_by(unique_id, one_year) %>%
+    mutate(one_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(one_year_crash_ind = case_when(
+      one_year_crash_num == 0 ~ 'No crash within 1 year',
+      one_year_crash_num == 1 ~ '1 crash within 1 year',
+      one_year_crash_num > 1 ~ '>1 crash within 1 year',
+      TRUE ~ ''
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+    select(unique_id, one_year, adrd_ever, one_year_crash_ind)
+  
+  temp3$one_year_crash_ind <- factor(temp3$one_year_crash_ind, levels = c('No crash within 1 year', '1 crash within 1 year', '>1 crash within 1 year'))
+  
+  # ---- 0–24 months window ----
+  temp4 <- data %>%
+    filter(two_year == 1) %>%
+    group_by(unique_id, two_year) %>%
+    mutate(two_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(two_year_crash_ind = case_when(
+      two_year_crash_num == 0 ~ 'No crash within 2 years',
+      two_year_crash_num == 1 ~ '1 crash within 2 years',
+      two_year_crash_num > 1 ~ '>1 crash within 2 years',
+      TRUE ~ ''
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>%
+    select(unique_id, two_year, adrd_ever, two_year_crash_ind)
+  
+  temp4$two_year_crash_ind <- factor(temp4$two_year_crash_ind, levels = c('No crash within 2 years', '1 crash within 2 years', '>1 crash within 2 years'))
+  
+  # ---- 0–36 months window ----
+  temp5 <- data %>%
+    filter(three_year == 1) %>%
+    group_by(unique_id, three_year) %>%
+    mutate(three_year_crash_num = sum(crash_count, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(three_year_crash_ind = case_when(
+      three_year_crash_num == 0 ~ 'No crash within 3 years',
+      three_year_crash_num == 1 ~ '1 crash within 3 years',
+      three_year_crash_num > 1 ~ '>1 crash within 3 years',
+      TRUE ~ ''
+    )) %>%
+    group_by(unique_id) %>%
+    slice_head(n=1)  %>%
+    select(unique_id, three_year, adrd_ever, three_year_crash_ind)
+  
+  temp5$three_year_crash_ind <- factor(temp5$three_year_crash_ind, levels = c('No crash within 3 years', '1 crash within 3 years', '>1 crash within 3 years'))
+  
+  # ---- Merge all windows; relabel ADRD vs. control for display ----
+  temp6 <- temp1 %>% 
+    full_join(temp2) %>% 
+    full_join(temp3) %>% 
+    full_join(temp4) %>% 
+    full_join(temp5) %>%
+    mutate(adrd_ever = case_when(
+      adrd_ever == 1 ~ 'ADRD',
+      adrd_ever == 0 ~ control
+    ))
+  
+  # Variables included in Table 3 (categorical levels per window)
+  myvars <- c('three_month_crash_ind', 'six_month_crash_ind', 'one_year_crash_ind', 'two_year_crash_ind', 'three_year_crash_ind')
+  catvars <- c('three_month_crash_ind', 'six_month_crash_ind', 'one_year_crash_ind', 'two_year_crash_ind', 'three_year_crash_ind')
+  
+  # Create frequency table with standardized mean differences (SMD)
+  table1 <- CreateTableOne(
+    vars = myvars,
+    factorVars = catvars,
+    strata = 'adrd_ever',
+    test = FALSE,
+    data = temp6)
+  
+  table <- print(table1, exact = "stage", quote = FALSE, noSpaces = TRUE, printToggle = FALSE, smd = TRUE)
+  return(table)
+}
+
+# --- Build Table 3 for each cohort and combine ----------------------------
+table3_ami_1_1 <- as.data.frame(table3(matched_ami_analytic_d_1_1, 'AMI'))
+table3_asth_1_1 <- as.data.frame(table3(matched_asth_analytic_d_1_1, 'Asthma'))
+table3_copd_1_1 <- as.data.frame(table3(matched_copd_analytic_d_1_1, 'COPD'))
+table3_diab_1_1 <- as.data.frame(table3(matched_diab_analytic_d_1_1, 'Diabetes'))
+table3_noadrd_1_1 <- as.data.frame(table3(matched_noadrd_all_analytic_d_1_1, 'No ADRD'))
+
+table3_combined_1_1 <- table3_ami_1_1 %>%
+  rename('AMI SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table3_asth_1_1) %>%
+  rename('Asthma SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table3_copd_1_1) %>%
+  rename('COPD SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table3_diab_1_1) %>%
+  rename('Diabetes SMD' = SMD) %>%
+  select(-ADRD) %>%
+  bind_cols(table3_noadrd_1_1) %>%
+  rename('No ADRD SMD' = SMD) %>%
+  relocate(ADRD, 'No ADRD','No ADRD SMD')
+
+# Save final combined table
+saveRDS(table3_combined_1_1, file = '//file_path/table3_combined_1_1.RDS')
+```
+
+# Incidence Figures
+
+1) We visualize monthly crash incidence relative to the index month (ADRD diagnosis or claim month for No ADRD). We:
+
+2) Load pre-computed, per–month incidence datasets for each cohort.
+
+3) Build a helper to compute denominators, proportions, and 95% CIs, and to tag cohorts.
+
+4) Pool cohorts into one long dataset and draw a faceted plot (one facet per cohort), with error bars.
+
+## Load incidence datasets
+
+```{r}
+# Pre-computed person-month incidence summaries for each cohort
+matched_ami_crash_plot_1_1 <- readRDS(file = '//file_path/matched_ami_crash_plot_1_1.RDS')
+matched_asth_crash_plot_1_1 <- readRDS(file = '//file_path/matched_asth_crash_plot_1_1.RDS')
+matched_copd_crash_plot_1_1 <- readRDS(file = '//file_path/matched_copd_crash_plot_1_1.RDS')
+matched_diab_crash_plot_1_1 <- readRDS(file = '//file_path/matched_diab_crash_plot_1_1.RDS')
+matched_noadrd_crash_plot_1_1 <- readRDS(file = '//file_path/matched_noadrd_crash_plot_1_1.RDS')
+```
+
+## Prepare pooled crash-incidence data
+
+The function crash_incidence_merge():
+  - Computes eligible_n (denominator) per (rel_month, adrd_ever).  
+  - Converts percent to a proportion and filters to rows where a crash occurred that month (crash_in_month == 1).  
+  - Keeps only one group (ADRD or control) depending on adrd_input.  
+  - Tags rows with a readable group label (e.g., “AMI”, “No ADRD”).  
+  - Calculates Wald 95% CIs (normal approximation) for plotting.  
+
+We then bind rows across cohorts to create a pooled dataset and set facet/legend order.
+
+```{r}
+crash_incidence_merge <- function(data, adrd_input, group_input){
+  new_data <- data %>%
+    group_by(rel_month, adrd_ever) %>%
+    mutate(eligible_n = sum(n)) %>% # denominator per month × group
+    ungroup() %>%
+    mutate(proportion = percent / 100) %>%
+    filter(crash_in_month == 1) %>% # only the crash rows for incidence
+    filter(adrd_ever == adrd_input) %>% # keep ADRD==1 or control==0
+    mutate(group = group_input) %>%
+    ungroup() %>%
+    mutate(proportion = percent / 100) %>%
+    mutate(one_minus_proportion_times_n = eligible_n*(1-proportion)) %>%
+    mutate(margin = qnorm(0.975)*sqrt(proportion*(1-proportion)/eligible_n)) %>%
+    mutate(lcl = (proportion - margin) * 100) %>%
+    mutate(ucl = (proportion + margin) * 100)
+  return(new_data)
+}
+
+# Pool cohorts: controls (adrd_input=0) for each disease + ADRD (adrd_input=1) from No ADRD file
+crash_merge_1_1 <- crash_incidence_merge(matched_ami_crash_plot_1_1, 0, 'AMI') %>%
+  bind_rows(crash_incidence_merge(matched_asth_crash_plot_1_1, 0, 'Asthma')) %>%
+  bind_rows(crash_incidence_merge(matched_copd_crash_plot_1_1, 0, 'COPD')) %>%
+  bind_rows(crash_incidence_merge(matched_diab_crash_plot_1_1, 0, 'Diabetes')) %>%
+  bind_rows(crash_incidence_merge(matched_noadrd_crash_plot_1_1, 0, 'No ADRD')) %>%
+  bind_rows(crash_incidence_merge(matched_noadrd_crash_plot_1_1, 1, 'ADRD'))
+
+# Order facets/legend entries
+crash_merge_1_1$group <- factor(crash_merge_1_1$group, levels = c('ADRD', 'No ADRD', 'AMI', 'Asthma', 'COPD', 'Diabetes'))
+```
+
+## Faceted crash-incidence plot (all groups)
+
+This plots percent crash incidence per month with 95% CI bars, reversing the x-axis sign so the scale runs −36 => 0 (months before diagnosis to index month). Each facet is a group.
+
+```{r}
+crash_multi_plot <- function(data, title){
+  new_data <- data %>%
+  filter(crash_in_month == 1) %>%
+  mutate(rel_month = rel_month * -1) %>% # show timeline as months before index
+  ggplot(aes(y = percent, x = rel_month, color = as.factor(group))) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin=lcl, ymax=ucl)) +
+  xlab("Months Relative to Bynum-Standard Diagnosis") +
+  ylab("Incidence (Percent)") +
+  labs(color = '') +
+  geom_hline(yintercept = 0) +
+  ggtitle(title) +
+  scale_x_continuous(limits = c(-36, 0), breaks=seq(-36,0,4)) +
+  scale_y_continuous(limits=c(0, 1.0), breaks=seq(0, 1.0, 0.25)) +
+  facet_wrap(vars(group), ncol = 2)
+  return(new_data)
+}
+
+crash_multi_plot_pool_1_1 <- crash_multi_plot(crash_merge_1_1, 'Matched 1:1 Crash Rate Relative to the Month of Diagnosis')
+
+crash_multi_plot_pool_1_1
+```
+
+### Per-cohort ADRD vs. control plots
+
+This function converts adrd_ever (0/1) to readable labels per control cohort and draws two lines per panel (ADRD vs. that control). Here, the y-scale is set to 0–2%; adjust as needed for your data range.
+
+```{r eval=FALSE}
+crash_plot <- function(dataset, control_description, title){
+    dataset <- dataset %>% 
+      mutate(adrd_ever = case_when(
+        adrd_ever == 1 ~ "Bynum-Standard Diagnosed ADRD",
+        adrd_ever == 0 ~ control_description
+      ))
+    dataset$adrd_ever <- factor(dataset$adrd_ever, levels = c("Bynum-Standard Diagnosed ADRD", control_description))
+    
+    plot <- dataset %>%
+      filter(crash_in_month == 1) %>%
+      mutate(rel_month = rel_month * -1) %>%
+      ggplot(aes(y = percent, x = rel_month, color = as.factor(adrd_ever))) +
+      geom_line() +
+      geom_point() +
+      #geom_smooth() +
+      xlab("Months Relative to Bynum-Standard Diagnosis") +
+      ylab("Incidence (Percent)") +
+      labs(color = '') +
+      ggtitle(title) +
+      scale_x_continuous(limits = c(-36, 0), breaks=seq(-36,0,2)) +
+      scale_y_continuous(limits=c(0, 2.0), breaks=seq(0, 2.0, 0.2))
+    return(plot)
+}
+
+ami_crash_plot_1_1 <- crash_plot(matched_ami_crash_plot_1_1, 'Acute Myocardial Infarction', 'Matched 1:1 Crash Incidence')
+asthma_crash_plot_1_1 <- crash_plot(matched_asth_crash_plot_1_1, 'Asthma', 'Matched 1:1 Crash Incidence')
+copd_crash_plot_1_1 <- crash_plot(matched_copd_crash_plot_1_1, 'COPD', 'Matched 1:1 Crash Incidence')
+diabetes_crash_plot_1_1 <- crash_plot(matched_diab_crash_plot_1_1, 'Diabetes', 'Matched 1:1 Crash Incidence')
+noadrd_crash_plot_1_1 <- crash_plot(matched_noadrd_crash_plot_1_1, 'No ADRD', 'Matched 1:1 Crash Incidence')
+
+ami_crash_plot_1_1
+
+asthma_crash_plot_1_1
+
+copd_crash_plot_1_1
+
+diabetes_crash_plot_1_1
+
+noadrd_crash_plot_1_1
+```

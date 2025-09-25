@@ -1,0 +1,427 @@
+---
+title: "crashes"
+author: "Steven Balog"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(haven)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Load necessary dataframes
+adrd_person_month <- readRDS("//file_path/adrd_person_month.RDS")
+#adrd_person_month is the restricted cohort with eligibility criteria applied
+```
+
+# Expand to Person-Months
+
+First create unique IDs. A unique ID is required for the overall no-ADRD group, as the Medicare beneficiary ID, bene_id_18900, repeats for different claim dates, which should be treated as distinct "individuals", or units, for the purposes of the analysis. Other controls already have a unique ID which is needed as there may be some overlap with the ADRD group (a control individual may later develop ADRD).
+
+```{r}
+# Read matched cohorts (person/person-claim level, pre-expansion) ----------------
+matched_ami_quarter_1_1 <- readRDS(file = '//file_path/matched_ami_quarter_1_1.RDS')
+matched_asth_quarter_1_1 <- readRDS(file = '//file_path/matched_asth_quarter_1_1.RDS')
+matched_copd_quarter_1_1 <- readRDS(file = '//file_path/matched_copd_quarter_1_1.RDS')
+matched_diab_quarter_1_1 <- readRDS(file = '//file_path/matched_diab_quarter_1_1.RDS')
+matched_noadrd_quarter_1_1 <- readRDS('//file_path/matched_noadrd_quarter_1_1.RDS')
+
+# Ensure uniqueness of IDs in the no-ADRD group ---------------------------
+# If claim_date is present, keep the existing unique_id (it already differentiates records).
+# If claim_date is missing (it is from the ADRD group), append a suffix to avoid accidental collisions.
+matched_noadrd_quarter_1_1_b <- matched_noadrd_quarter_1_1 %>%
+  mutate(unique_id = case_when(
+    !is.na(claim_date) ~ unique_id,
+    TRUE ~ str_c(unique_id, '_ADRD')))
+
+# Clean up RAM if the dataset is large
+remove(matched_noadrd_quarter_1_1)
+```
+
+Now, take the datasets that have matched those with ADRD to those without ADRD in each control group and expand them from the person (or event) level to a person-month level. This is necessary in order to determine incidence of crash and/or citation in each month relative to the diagnosis date.
+
+```{r}
+# Helper to expand to person-months and build core variables ---------------
+
+# Input: dataset at person/event level with:
+#   - unique_id : unique person/event identifier
+#   - rel_month : (in input) relative month, will be dropped before expansion
+#   - diagnosis_month : a YYYY-MM or date-like string parsable by lubridate::ym()
+#   - adrd : logical or binary indicator of ADRD
+#   - bynum_standard_month : a month string (YYYY-MM) indicating the month of ADRD diagnosis to compare against cal_month
+#
+# Output: person-month panel with rows for rel_month 0:36 prior to diagnosis
+#         (0 = the diagnosis month itself), plus ADRD flags.
+
+expand_perscrash <- function(dataset){
+  
+  # Collapse to one row per unique_id (keep earliest row per ID)
+  adrd_restr_i_person_level <- dataset %>%
+    group_by(unique_id) %>%
+    slice_head(n=1) %>% # take the first row per ID
+    select(-rel_month) %>% # remove existing rel_month to avoid confusion
+    ungroup()
+  
+  # Expand to 37 rows per person: rel_month = 0..36 (0 = index month, 36 = 36 months before)
+  # Then join person-level attributes back onto the expanded grid.
+  adrd_person_month <- adrd_restr_i_person_level %>%
+    select(unique_id) %>%
+    expand(unique_id, rel_month = 0:36) %>%
+    full_join(adrd_restr_i_person_level)
+  
+  # Compute a calendar month label for each person-month -------------------
+  # We assume diagnosis_month is month-precision (e.g., "2018-05").
+  # cal_month = diagnosis_month - rel_month months, formatted as "YYYY-MM".
+  adrd_person_month <- adrd_person_month %>%
+    mutate(cal_month = format_ISO8601(
+      # Subtract N months to go backward in time from diagnosis month
+      ym(diagnosis_month) - months(rel_month), precision = "ym")
+    )
+  
+  # Create ADRD indicators -------------------------------------------------
+  # adrd_ever: did this person ever have ADRD? (coerced to 0/1)
+  # adrd_now : is this the diagnosis month? (bynum_standard_month must match "YYYY-MM")
+  adrd_person_month <- adrd_person_month %>%
+    mutate(adrd_ever = case_when(
+      adrd == TRUE ~ 1,
+      adrd == FALSE ~ 0
+    )) %>%
+    mutate(adrd_now = case_when(
+      is.na(bynum_standard_month) ~ 0, # if we don't have a month recorded, treat as 0
+      bynum_standard_month == cal_month ~ 1, # matches this calendar month => diagnosis month
+      TRUE ~ 0
+    ))
+  
+  return(adrd_person_month)
+  
+}
+
+# Apply expansion to each matched cohort -----------------------------------
+matched_ami_persmonth_1_1 <- expand_perscrash(matched_ami_quarter_1_1)
+matched_asth_persmonth_1_1 <- expand_perscrash(matched_asth_quarter_1_1)
+matched_copd_persmonth_1_1 <- expand_perscrash(matched_copd_quarter_1_1)
+matched_diab_persmonth_1_1 <- expand_perscrash(matched_diab_quarter_1_1)
+matched_noadrd_persmonth_1_1 <- expand_perscrash(matched_noadrd_quarter_1_1_b)
+
+# Tidy up temporary objects ------------------------------------------------
+remove(matched_ami_quarter_1_1, 
+       matched_asth_quarter_1_1, 
+       matched_copd_quarter_1_1, 
+       matched_diab_quarter_1_1, 
+       matched_noadrd_quarter_1_1_b, 
+       expand_perscrash)
+```
+
+# Create Crash Indicator Variable
+
+Create a variable indicating whether the individual experienced a crash within each month because we are interested in how many individuals had a crash in each month, relative to the diagnosis date.
+
+In order to create the variable, we need to bring in the crash information. First load in the driver level NJSHO crash information file.
+
+Create a function named driver_merge which will create the crash indicator variable for each control group dataset. Within the function, for each subset file, keep only the NJSHO_ID, acc_id (accident ID), accveh_id (accident-vehicle ID), and crashdate variables in order to make merging easier and keep the new dataset tidy and only as large as necessary. Then right join with dataset, which is an input for the function.
+
+Still within the function, create a month variable, crash_month, for the crash by keeping only the month and year from the crashdate variable. This is needed as analyses take place at the month level.
+
+Create a new dataset named persmonth_crash_b which keeps only rows where the cal_month (the calendar month of the month of followup) equals the crash month (month of the crash). This will remove any crashes that occur outside the study period and will match the crash to the month of followup in which it occurred. Now, create a variable named 'n' which equals 1 which will be counted to create another variable. Group by unique_id and cal_month and create a variable named crash_count, which counts the number of crashes for each person-month. Lastly, ungroup and right join with dataset to bring back all person-month without a crash. Return persmonth_crash_b as the output for the function and end the function.
+
+```{r}
+# --- Load SAS crash subsets (driver-level) --------------------------------
+# Should have: NJSHO_ID, acc_id, accveh_id, crashdate (date or datetime)
+
+crash <- read_sas("//file_path/driver0419_20241023.sas7bdat") %>%
+  select(NJSHO_ID, crash_id, driver_id, crashdate)
+
+# --- Function: merge driver subsets into person-month & compute crash count ----
+# Inputs:
+#   - dataset: person-month data with columns:
+#       unique_id, cal_month (YYYY-MM), adrd_ever (0/1), NJSHO_ID
+#   - crash: ADRD driver-level crash subset (see columns above)
+#
+# Output:
+#   - person-month data with crash_count (number of crashes in that month)
+driver_merge <- function(dataset, control_driver_dataset){
+  
+  # --- Join the population to the driver subset ------------------
+  persmonth_crash <- crash %>%
+    right_join(dataset)
+  
+  # --- Build crash month and align to person-month ------------------------
+  persmonth_crash <- persmonth_crash %>%
+    mutate(crash_month = format_ISO8601(crashdate, precision = "ym"))
+  
+  # Keep rows where crash happens in the same calendar month as the person-month
+  # Then aggregate to one row per (unique_id, cal_month) with a count.
+  persmonth_crash_b <- persmonth_crash %>%
+    mutate(n = 1) %>% #create a variable to sum for the count
+    filter(cal_month == crash_month) %>% #temporarily keep only rows where the crash month and person-month are the same
+    group_by(unique_id, cal_month) %>% #group by person-month
+    mutate(crash_count = sum(n)) %>% #count the number of rows per person-month, which indicates unique crashes
+    ungroup() %>% #reduce to person-month from person-month-crash
+    #create a crash indicator for each month
+    mutate(crashonly_month = case_when(
+      !(is.na(crash_month)) ~ 1,
+      TRUE ~ 0
+    )) %>%
+    right_join(dataset) #join back with the rest of the dataset (those without a crash)
+  
+  return(persmonth_crash_b)
+}
+```
+
+Run the driver_merge function for each control group and keep the outputs. Remove no-longer-needed objects to free memory.
+
+```{r}
+matched_ami_analytic_b_1_1 <- driver_merge(matched_ami_persmonth_1_1, nonadrd_driver_subset)
+matched_asth_analytic_b_1_1 <- driver_merge(matched_asth_persmonth_1_1, nonadrd_driver_subset)
+matched_copd_analytic_b_1_1 <- driver_merge(matched_copd_persmonth_1_1, nonadrd_driver_subset)
+matched_diab_analytic_b_1_1 <- driver_merge(matched_diab_persmonth_1_1, nonadrd_driver_subset)
+matched_noadrd_analytic_b_1_1 <- driver_merge(matched_noadrd_persmonth_1_1, noadrd_all_driver_subset)
+
+remove(matched_ami_persmonth_1_1, 
+       matched_asth_persmonth_1_1, 
+       matched_copd_persmonth_1_1, 
+       matched_diab_persmonth_1_1, 
+       matched_noadrd_persmonth_1_1, 
+       crash)
+```
+
+
+
+
+
+
+
+
+
+# Crash Incidence Plot
+
+The function crash_plot_data() prepares the person-month dataset for plotting by:
+
+1) Identifying crash events in each month:
+For each (unique_id, rel_month), it creates a binary variable crash_in_month, equal to 1 if the person had a crash in the month.
+
+2) Summarizing at the person-month level:
+It takes the maximum crash indicator across possible rows to ensure each person-month has a single value (0/1).
+
+3) Aggregating by group:
+It counts how many people in each (rel_month, adrd_ever) group experienced a crash (crash_in_month == 1) versus not.
+
+4) Calculating percentages:
+It converts counts to percentages within each (rel_month, adrd_ever) group.
+
+## Create the dataset for the crash plot
+
+```{r}
+# --- Function to prepare crash plot data ---------------------------------
+crash_plot_data <- function(dataset){
+  plot_data_crash <- dataset %>%
+    group_by(unique_id, rel_month) %>%
+    # Create 0/1 indicator of whether a crash occurred in that month
+    mutate(crash_in_month = max(case_when(
+      crashonly_month == 1 ~ 1,
+      TRUE ~ 0
+    ))) %>%
+    # Keep one row per person-month (ensures uniqueness)
+    slice_max(crash_in_month) %>%
+    # Aggregate counts by month and ADRD status
+    group_by(rel_month, adrd_ever) %>%
+    count(crash_in_month) %>%
+    # Calculate percent of each group with/without crash
+    group_by(rel_month, adrd_ever) %>%
+    mutate(percent = n / sum(n) * 100)
+  return(plot_data_crash)
+}
+
+# --- Apply function to each analytic dataset -----------------------------
+matched_ami_crash_plot_1_1 <- crash_plot_data(matched_ami_analytic_b_1_1)
+matched_asth_crash_plot_1_1 <- crash_plot_data(matched_asth_analytic_b_1_1)
+matched_copd_crash_plot_1_1 <- crash_plot_data(matched_copd_analytic_b_1_1)
+matched_diab_crash_plot_1_1 <- crash_plot_data(matched_diab_analytic_b_1_1)
+matched_noadrd_crash_plot_1_1 <- crash_plot_data(matched_noadrd_analytic_b_1_1)
+
+# Save processed datasets for reproducibility -----------------------------
+saveRDS(matched_ami_crash_plot_1_1,   file = '//file_path/matched_ami_crash_plot_1_1.RDS')
+saveRDS(matched_asth_crash_plot_1_1,  file = '//file_path/matched_asth_crash_plot_1_1.RDS')
+saveRDS(matched_copd_crash_plot_1_1,  file = '//file_path/matched_copd_crash_plot_1_1.RDS')
+saveRDS(matched_diab_crash_plot_1_1,  file = '//file_path/matched_diab_crash_plot_1_1.RDS')
+saveRDS(matched_noadrd_crash_plot_1_1,file = '//file_path/matched_noadrd_crash_plot_1_1.RDS')
+saveRDS(matched_ami_crash_plot_1_1, file = '//file_path/matched_ami_crash_plot_1_1.RDS')
+saveRDS(matched_asth_crash_plot_1_1, file = '//file_path/matched_asth_crash_plot_1_1.RDS')
+saveRDS(matched_copd_crash_plot_1_1, file = '//file_path/matched_copd_crash_plot_1_1.RDS')
+saveRDS(matched_diab_crash_plot_1_1, file = '//file_path/matched_diab_crash_plot_1_1.RDS')
+saveRDS(matched_noadrd_crash_plot_1_1, file = '//file_path/matched_noadrd_crash_plot_1_1.RDS')
+
+```
+
+## Create the crash plot
+
+The function crash_plot() produces the visualization for a given analytic dataset:  
+
+1) Labeling groups: Converts adrd_ever into descriptive labels (ADRD vs. control group).  
+2) Calculating denominators: For each (rel_month, adrd_ever), computes the number of eligible individuals (eligible_n).  
+3) Proportions and confidence intervals:  
+   - Converts percentages to proportions.  
+   - Computes 95% confidence intervals for crash incidence per month using the normal approximation.  
+   - Calculates lcl and ucl (lower/upper confidence limits).  
+4) Reversing time axis: Multiplies rel_month by -1 so the x-axis runs backward (36 months before diagnosis => 0).  
+5) Plotting: Draws a line plot with points and error bars.  
+
+```{r, eval=FALSE}
+# Reload pre-processed crash plot data if needed --------------------------
+matched_ami_crash_plot_1_1 <- readRDS(file = '//file_path/matched_ami_crash_plot_1_1.RDS')
+matched_asth_crash_plot_1_1 <- readRDS(file = '//file_path/matched_asth_crash_plot_1_1.RDS')
+matched_copd_crash_plot_1_1 <- readRDS(file = '//file_path/matched_copd_crash_plot_1_1.RDS')
+matched_diab_crash_plot_1_1 <- readRDS(file = '//file_path/matched_diab_crash_plot_1_1.RDS')
+matched_noadrd_crash_plot_1_1 <- readRDS(file = '//file_path/matched_noadrd_crash_plot_1_1.RDS')
+
+# --- Function to build the crash incidence plot --------------------------
+crash_plot <- function(dataset, control_description, title){
+    dataset <- dataset %>% 
+      mutate(adrd_ever = case_when(
+        adrd_ever == 1 ~ "Bynum-Standard Diagnosed ADRD",
+        adrd_ever == 0 ~ control_description
+      ))
+    dataset$adrd_ever <- factor(dataset$adrd_ever, levels = c("Bynum-Standard Diagnosed ADRD", control_description))
+    
+    plot <- dataset %>%
+      group_by(rel_month, adrd_ever) %>%
+      mutate(eligible_n = sum(n)) %>% # denominator for proportions
+      ungroup() %>%
+      mutate(proportion = percent / 100) %>%
+      filter(crash_in_month == 1) %>% # keep rows with crash incidence
+      mutate(one_minus_proportion_times_n = eligible_n*(1-proportion)) %>%
+      mutate(margin = qnorm(0.975)*sqrt(proportion*(1-proportion)/eligible_n)) %>%
+      mutate(lcl = (proportion - margin) * 100) %>%
+      mutate(ucl = (proportion + margin) * 100) %>%
+      mutate(rel_month = rel_month * -1) %>% # reverse timeline for plotting
+      ggplot(aes(y = percent, x = rel_month, color = as.factor(adrd_ever))) +
+      geom_line() +
+      geom_point() +
+      geom_errorbar(aes(ymin=lcl, ymax=ucl)) +
+      xlab("Months Relative to Bynum-Standard Diagnosis") +
+      ylab("Incidence (Percent)") +
+      labs(color = '') +
+      ggtitle(title) +
+      scale_x_continuous(limits = c(-36, 0), breaks=seq(-36,0,2)) +
+      scale_y_continuous(limits=c(0, 1.0), breaks=seq(0, 1.0, 0.1))
+    return(plot)
+}
+
+# --- Build plots for each cohort -----------------------------------------
+ami_crash_plot_1_1 <- crash_plot(matched_ami_crash_plot_1_1, 'Acute Myocardial Infarction', 'Matched 1:1 Crash Incidence')
+asthma_crash_plot_1_1 <- crash_plot(matched_asth_crash_plot_1_1, 'Asthma', 'Matched 1:1 Crash Incidence')
+copd_crash_plot_1_1 <- crash_plot(matched_copd_crash_plot_1_1, 'COPD', 'Matched 1:1 Crash Incidence')
+diabetes_crash_plot_1_1 <- crash_plot(matched_diab_crash_plot_1_1, 'Diabetes', 'Matched 1:1 Crash Incidence')
+noadrd_crash_plot_1_1 <- crash_plot(matched_noadrd_crash_plot_1_1, 'No ADRD', 'Matched 1:1 Crash Incidence')
+
+# Display plots -----------------------------------------------------------
+ami_crash_plot_1_1
+asthma_crash_plot_1_1
+copd_crash_plot_1_1
+diabetes_crash_plot_1_1
+noadrd_crash_plot_1_1
+```
+
+# Crash Incidence Relative to Month of Diagnosis Plot
+
+This section compares the monthly crash incidence rate relative to the diagnosis month. Instead of looking at raw crash percentages, we compute the difference in incidence between each month and the month of diagnosis (rel_month == 0).
+
+This allows us to examine whether the incidence of crashes in the months leading up to diagnosis is higher or lower relative to the baseline month of diagnosis.
+
+## Step 1: Compute relative crash rates
+
+The function crash_rate() transforms the dataset by:
+
+1) Filtering for crash months only: Keeps rows where crash_in_month == 1.
+
+2) Capturing baseline (diagnosis month) crash rate: Within each adrd_ever group, identifies the percent of crashes at rel_month == 0 and stores it as month36_rate.
+
+3) Computing differences: Subtracts this baseline (month36_rate) from the observed percent in every month, creating rate.
+
+  - Positive values mean the month had higher crash incidence than diagnosis month.
+
+  - Negative values mean lower crash incidence than diagnosis month.
+
+```{r}
+# --- Function: calculate crash incidence relative to diagnosis month ------
+crash_rate <- function(data){
+new_data <- data %>%
+  filter(crash_in_month == 1) %>% # only consider months with crash events
+  group_by(adrd_ever) %>%
+  # capture crash incidence at month of diagnosis (rel_month == 0)
+  mutate(month36_rate = max(case_when(
+    rel_month == 0 ~ percent
+  ), na.rm = TRUE)) %>%
+  # difference from diagnosis month incidence
+  mutate(rate = percent - month36_rate)
+return(new_data)
+}
+```
+
+## Step 2: Create the crash rate difference plot  
+
+The function crash_rate_plot() produces a visualization of these differences:  
+
+1) Apply crash rate transformation: Calls crash_rate() to generate rate.  
+2) Label groups: Converts adrd_ever into descriptive labels (“Bynum-Standard Diagnosed ADRD” vs. control group).  
+3) Reverse time axis: Multiplies rel_month by −1 so the x-axis goes from 36 months before diagnosis to 0.  
+4) Plot:  
+   - X-axis: months before diagnosis.  
+   - Y-axis: difference in incidence (%), relative to the diagnosis month.  
+   - Each group has its own line, with points for each month.  
+   - Y = 0 corresponds to the diagnosis month incidence (baseline).
+
+```{r}
+# --- Function: build the relative crash incidence plot --------------------
+crash_rate_plot <- function(data, control_description, title){
+  
+  dataset <- crash_rate(data)
+  
+  dataset <- dataset %>% 
+    mutate(adrd_ever = case_when(
+      adrd_ever == 1 ~ "Bynum-Standard Diagnosed ADRD",
+      adrd_ever == 0 ~ control_description
+    ))
+  
+  # Ensure consistent ordering in plot legend
+  dataset$adrd_ever <- factor(dataset$adrd_ever, levels = c("Bynum-Standard Diagnosed ADRD", control_description))
+  
+  plot <- dataset %>%
+    filter(crash_in_month == 1) %>%
+    mutate(rel_month = rel_month * -1) %>%
+    ggplot(aes(y = rate, x = rel_month, color = as.factor(adrd_ever))) +
+    geom_line() +
+    geom_point() +
+    xlab("Months Relative to Bynum-Standard Diagnosis") +
+    ylab("Difference in Incidence (Percent)") +
+    labs(color = '') +
+    ggtitle(title) +
+    scale_x_continuous(limits = c(-36, 0), breaks=seq(-36,0,2)) +
+    scale_y_continuous(limits=c(-1, 1), breaks=seq(-1, 1, 0.2))
+  return(plot)
+}
+```
+
+## Step 3: Generate plots for each cohort  
+
+We apply crash_rate_plot() to each matched analytic dataset, comparing ADRD to different control groups. 
+
+```{r}
+# --- Apply function to each matched cohort --------------------------------
+crash_rate_ami_plot_1_1 <- crash_rate_plot(matched_ami_crash_plot_1_1, 'AMI', 'Matched 1:1 Change in Crash Rate Relative to the Month of Diagnosis')
+crash_rate_asth_plot_1_1 <- crash_rate_plot(matched_asth_crash_plot_1_1, 'Asthma', 'Matched 1:1 Change in Crash Rate Relative to the Month of Diagnosis')
+crash_rate_copd_plot_1_1 <- crash_rate_plot(matched_copd_crash_plot_1_1, 'COPD', 'Matched 1:1 Change in Crash Rate Relative to the Month of Diagnosis')
+crash_rate_diab_plot_1_1 <- crash_rate_plot(matched_diab_crash_plot_1_1, 'Diabetes', 'Matched 1:1 Change in Crash Rate Relative to the Month of Diagnosis')
+crash_rate_noadrd_plot_1_1 <- crash_rate_plot(matched_noadrd_crash_plot_1_1, 'No ADRD', 'Matched 1:1 Change in Crash Rate Relative to the Month of Diagnosis')
+
+# --- Display plots --------------------------------------------------------
+crash_rate_ami_plot_1_1
+crash_rate_asth_plot_1_1
+crash_rate_copd_plot_1_1
+crash_rate_diab_plot_1_1
+crash_rate_noadrd_plot_1_1
+```
+
